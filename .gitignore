@@ -1,0 +1,7 @@
+node_modules/
+frames/
+shots/
+out/track.wav
+out/*.tmp.mp4
+out/.tmp*
+.DS_Store

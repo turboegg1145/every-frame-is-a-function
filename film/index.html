@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>每一帧都是时间的函数 — every frame is code</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{display:block;margin:0 auto;max-width:100vw;max-height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   每一帧都是时间的函数 · every frame is code
+   一个 HTML 文件，一块画布，一个脚本。没有素材、没有图片、没有 CDN。
+   第 n 帧 = f(n)：不依赖上一帧，所以可以 seek 到任意一秒，重渲必然一致。
+
+   URL 旋钮： ?f=140  单帧     ?s=12 种子    ?w=1920 宽度
+             ?grid=24 拉片（联系表）  ?from=60&to=180   ?ar=9:16
+             什么都不带 = 浏览器里的实时预览
+   文件结构：参数 -> 生成器 -> 数学 -> 画布池 -> 调色板 -> 辅助 -> 引擎 -> 分镜 -> 启动
+   ===================================================================== */
+
+/* ---------- 参数 ---------- */
+const Q = new URLSearchParams(location.search);
+const FPS = 30, BPM = 120;
+const BEAT = Math.round(FPS * 60 / BPM);   // 120BPM -> 一拍 15 帧
+const BAR  = BEAT * 4;                     // 一小节 60 帧 = 2 秒
+const SHORT = 1080;                        // 逻辑短边：所有几何都在这个尺度里写
+function parseAR(s){ const m=/^(\d+(?:\.\d+)?)[:x\/](\d+(?:\.\d+)?)$/.exec(s||''); return m ? (+m[1])/(+m[2]) : 16/9; }
+const AR  = parseAR(Q.get('ar') || '16:9');
+const LW  = AR >= 1 ? Math.round(SHORT*AR) : SHORT;
+const LH  = AR >= 1 ? SHORT : Math.round(SHORT/AR);
+const CX  = LW/2, CY = LH/2;
+const SEED  = +(Q.get('s') || 7);
+const WIDTH = +(Q.get('w') || 1920);
+const SAFE  = 0.07;
+const TITLE_Y = AR < 1 ? 0.70 : 0.84;
+
+/* ---------- 生成器：任何参数 -> 确定性随机 ---------- */
+function hash(){                                    // FNV-1a，任意参数 -> 32 位种子
+  let h = 2166136261 >>> 0;
+  for (let k=0;k<arguments.length;k++){ const s=String(arguments[k])+'|';
+    for (let i=0;i<s.length;i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } }
+  h ^= h>>>13; h = Math.imul(h, 0x5bd1e995); h ^= h>>>15;
+  return h >>> 0;
+}
+function rng(seed){                                 // sfc32
+  let a=seed>>>0, b=0x9e3779b9, c=0x6a09e667, d=0xbb67ae85;
+  const f=()=>{ a>>>=0;b>>>=0;c>>>=0;d>>>=0; let t=(a+b)|0; a=b^(b>>>9); b=(c+(c<<3))|0;
+    c=(c<<21)|(c>>>11); d=(d+1)|0; t=(t+d)|0; c=(c+t)|0; return (t>>>0)/4294967296; };
+  for(let i=0;i<12;i++) f();
+  return { f, r:(lo,hi)=>lo+(hi-lo)*f(), i:(n)=>Math.floor(f()*n),
+           pick:(arr)=>arr[Math.floor(f()*arr.length)], chance:(p)=>f()<p,
+           sign:()=>f()<0.5?-1:1 };
+}
+
+/* ---------- 数学 ---------- */
+const clamp=(v,a=0,b=1)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const span=(f,a,b)=>clamp((f-a)/(b-a));
+const smooth=t=>{t=clamp(t);return t*t*(3-2*t)};
+const ease=Object.freeze({
+  out:t=>1-Math.pow(1-clamp(t),3),
+  out4:t=>1-Math.pow(1-clamp(t),4),
+  outExpo:t=>t>=1?1:1-Math.pow(2,-10*clamp(t)),
+  in:t=>Math.pow(clamp(t),3),
+  io:t=>{t=clamp(t);return t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2},
+  back:t=>{const c=1.70158;t=clamp(t);return 1+(c+1)*Math.pow(t-1,3)+c*Math.pow(t-1,2)},
+});
+/* 闭式弹簧：不用积分，所以 t 一跳就直接得到该时刻的值 */
+function spring(t,zeta=0.42,omega=15){
+  if(t<=0) return 0;
+  const wd=omega*Math.sqrt(1-zeta*zeta);
+  return 1-Math.exp(-zeta*omega*t)*(Math.cos(wd*t)+(zeta*omega/wd)*Math.sin(wd*t));
+}
+/* 错位：第 i 个元素比第 i-1 个晚 start 一点点开始 */
+function stagger(t,start,dur,i,n,spread=0.35,curve=ease.out4){
+  const s=start+(n>1?i/(n-1):0)*spread;
+  return curve(span(t,s,s+dur));
+}
+const pad=(n,w=2)=>String(n).padStart(w,'0');
+const bayer=(x,y)=>{                                 // 4x4 有序抖动矩阵，0..1
+  const B=[[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+  return B[((y%4)+4)%4][((x%4)+4)%4]/16;
+};
+
+/* ---------- 画布池：离屏画布复用，但不能留上一帧的脏 ---------- */
+const POOL={};
+function cvs(name,w,h){
+  let c=POOL[name];
+  if(!c){ c=document.createElement('canvas'); c.getContext('2d',{willReadFrequently:true}); POOL[name]=c; }
+  if(c.width!==w||c.height!==h){ c.width=w; c.height=h; }
+  return c;
+}
+/* 池里的画布跨帧保留上下文：save 没 restore、clip、shadow、合成模式
+   都会泄漏到下一帧，帧就开始依赖渲染顺序。所以每帧开头必须擦干净。 */
+function wipe(g){ if(g.reset) g.reset(); else g.canvas.width=g.canvas.width; return g; }
+
+/* ---------- 调色板 + 字体 ---------- */
+const F_MONO='"DejaVu Sans Mono","Noto Sans Mono",Menlo,Consolas,monospace';
+const F_SANS='"Helvetica Neue",Helvetica,"Liberation Sans","DejaVu Sans",Arial,sans-serif';
+const F_CJK='"Noto Sans CJK SC","Noto Sans SC","WenQuanYi Micro Hei","DejaVu Sans",sans-serif';
+
+/* 墨线：纸、墨、中间调，朱砂只占 5% */
+const INK=Object.freeze({bg:'#e9dfc9', paper:'#f3ecdb', ink:'#2b2620', mid:'#8a7a60', light:'#fbf7ee', accent:'#a33028'});
+/* 像素：sweetie16 */
+const P16=['#1a1c2c','#5d275d','#b13e53','#ef7d57','#ffcd75','#a7f070','#38b764','#257179',
+           '#29366f','#3b5dc9','#41a6f6','#73eff7','#f4f4f4','#94b0c2','#566c86','#333c57'];
+/* 瑞士海报 */
+const POS=Object.freeze({bg:'#f2f0eb', ink:'#111111', mid:'#7d7d7d', red:'#e3242b', white:'#ffffff'});
+/* 磷光终端 */
+const PHO=Object.freeze({bg:'#030603', mid:'#175c17', lit:'#5fdc5f', hi:'#c8ffc8', white:'#ffffff'});
+
+/* =====================================================================
+   辅助
+   ===================================================================== */
+
+/* ---- 手抖的线：每 3 帧重掷一次，线条就会“沸腾”，像手绘动画 ---- */
+function boil(pts,b,amp){
+  const out=[];
+  for(let i=0;i<pts.length;i++){
+    const p=pts[i], q=pts[Math.min(i+1,pts.length-1)], r=pts[Math.max(i-1,0)];
+    let nx=-(q[1]-r[1]), ny=(q[0]-r[0]); const L=Math.hypot(nx,ny)||1; nx/=L; ny/=L;
+    const j=(b.f()*2-1)*amp;
+    out.push([p[0]+nx*j, p[1]+ny*j]);
+  }
+  return out;
+}
+/* ---- 按累计长度揭示的折线：恒定笔速，不是按点均分 ---- */
+function inkLine(g,pts,o={}){
+  const rev=o.reveal??1; if(rev<=0.001||pts.length<2) return;
+  let total=0; const seg=[];
+  for(let i=1;i<pts.length;i++){ const d=Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1]); seg.push(d); total+=d; }
+  const want=total*rev;
+  g.save();
+  g.strokeStyle=o.color||INK.ink; g.lineWidth=o.w??2.4;
+  g.lineCap=o.cap||'round'; g.lineJoin='round';
+  if(o.alpha!=null) g.globalAlpha=o.alpha;
+  g.beginPath(); g.moveTo(pts[0][0],pts[0][1]);
+  let acc=0;
+  for(let i=1;i<pts.length;i++){
+    if(acc+seg[i-1]<=want){ g.lineTo(pts[i][0],pts[i][1]); acc+=seg[i-1]; }
+    else{ const k=(want-acc)/(seg[i-1]||1);
+      g.lineTo(lerp(pts[i-1][0],pts[i][0],k), lerp(pts[i-1][1],pts[i][1],k)); break; }
+  }
+  g.stroke(); g.restore();
+}
+/* ---- 一条山脊：几个正弦叠加 = 一维分形，天然像山 ---- */
+function ridgePts(x0,x1,yBase,amp,R,n=90){
+  const k=4, ph=[], fr=[], am=[];
+  for(let j=0;j<k;j++){ ph.push(R.r(0,6.283)); fr.push(1.7*Math.pow(2.1,j)); am.push(1/Math.pow(1.9,j)); }
+  const norm=am.reduce((a,b)=>a+b,0), pts=[];
+  for(let i=0;i<=n;i++){
+    const u=i/n, x=lerp(x0,x1,u); let y=0;
+    for(let j=0;j<k;j++) y+=Math.sin(u*fr[j]*2.4+ph[j])*am[j];
+    y=y/norm;
+    pts.push([x, yBase - (y*0.5+0.5)*amp]);
+  }
+  return pts;
+}
+/* ---- 斜排线（版画的阴影全靠它） ---- */
+function hatch(g,x0,y0,x1,y1,spacing,angle,o={}){
+  g.save();
+  g.strokeStyle=o.color||INK.mid; g.lineWidth=o.w??1.1;
+  if(o.alpha!=null) g.globalAlpha=o.alpha;
+  const D=Math.hypot(x1-x0,y1-y0)*1.6, cx=(x0+x1)/2, cy=(y0+y1)/2;
+  const dx=Math.cos(angle), dy=Math.sin(angle);
+  g.beginPath();
+  for(let d=-D; d<=D; d+=spacing){
+    const px=cx-dy*d, py=cy+dx*d;
+    g.moveTo(px-dx*D, py-dy*D); g.lineTo(px+dx*D, py+dy*D);
+  }
+  g.stroke(); g.restore();
+}
+/* ---- 半调网点：缓存成 pattern，不要每帧画几千个圆 ---- */
+function halftone(g,x,y,w,h,cell,color,alpha=1){
+  const key='ht'+cell;
+  let c=POOL[key];
+  if(!c || c.__color!==color){
+    c=cvs(key,cell,cell); c.__color=color;
+    const cg=wipe(c.getContext('2d'));
+    cg.fillStyle=color; cg.beginPath(); cg.arc(cell/2,cell/2,cell*0.26,0,6.283); cg.fill();
+  }
+  g.save(); g.globalAlpha=alpha; g.fillStyle=g.createPattern(c,'repeat');
+  g.fillRect(x,y,w,h); g.restore();
+}
+/* ---- 扫描线 pattern ---- */
+function scanlines(g,x,y,w,h,period,alpha,color='#000'){
+  const key='sl'+period, c=cvs(key,1,period);
+  const cg=wipe(c.getContext('2d'));
+  cg.fillStyle=color; cg.fillRect(0,0,1,Math.max(1,Math.round(period*0.42)));
+  g.save(); g.globalAlpha=alpha; g.fillStyle=g.createPattern(c,'repeat');
+  g.fillRect(x,y,w,h); g.restore();
+}
+/* ---- 位图字：系统字体 -> 阈值 -> 整数倍放大，得到终端/OSD 的硬边 ---- */
+const GLYPH={};
+function glyphs(str,o){
+  const px=o.px||14, font=`${o.weight||'bold'} ${px}px ${o.font||F_MONO}`, thr=(o.thr||0.5)*255;
+  const key=str+'~#~'+font+'~#~'+thr;
+  if(GLYPH[key]) return GLYPH[key];
+  const m=document.createElement('canvas'); let mg=m.getContext('2d'); mg.font=font;
+  const tw=Math.ceil(mg.measureText(str).width)+8, th=Math.ceil(px*1.7)+8;
+  m.width=tw; m.height=th; mg=m.getContext('2d'); mg.font=font;
+  mg.fillStyle='#fff'; mg.textBaseline='alphabetic'; mg.fillText(str,4,Math.round(px*1.2));
+  const id=mg.getImageData(0,0,tw,th), d=id.data; let x0=tw,x1=-1,y0=th,y1=-1;
+  for(let y=0;y<th;y++)for(let x=0;x<tw;x++){
+    const i=(y*tw+x)*4, on=d[i+3]>thr;
+    d[i]=d[i+1]=d[i+2]=255; d[i+3]=on?255:0;
+    if(on){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+  }
+  if(x1<0){x0=0;x1=0;y0=0;y1=0;}
+  mg.putImageData(id,0,0);
+  return GLYPH[key]={c:m,x0,y0,w:x1-x0+1,h:y1-y0+1};
+}
+function pixText(g,str,o){
+  const raw=o.raw||glyphs(str,o); const G=raw.c?raw:glyphs(raw.key,raw.o);
+  let cell=o.cell||6;
+  if(o.fit) cell=Math.max(1,Math.min(cell,Math.floor(o.fit/G.w)));
+  const w=G.w*cell, h=G.h*cell;
+  let x=o.x, y=o.y;
+  if(o.align==='center') x-=w/2; else if(o.align==='right') x-=w;
+  if(o.base==='middle') y-=h/2; else if(o.base==='bottom') y-=h;
+  x=Math.round(x/cell)*cell; y=Math.round(y/cell)*cell;    // 吸附到字形网格，否则字母逐帧抖
+  if(o.bg){ const p=(o.pad??1)*cell; g.fillStyle=o.bg; g.fillRect(x-p,y-p,w+2*p,h+2*p); }
+  const rev=o.reveal??1; if(rev<=0) return {x,y,w,h};
+  const sw=Math.max(1,Math.round(G.w*rev));
+  const t=cvs('tint',G.w,G.h), tg=wipe(t.getContext('2d'));
+  tg.drawImage(G.c,G.x0,G.y0,G.w,G.h,0,0,G.w,G.h);
+  tg.globalCompositeOperation='source-in';
+  tg.fillStyle=o.color||'#fff'; tg.fillRect(0,0,G.w,G.h);
+  tg.globalCompositeOperation='source-over';
+  g.save(); g.imageSmoothingEnabled=false;
+  if(o.alpha!=null) g.globalAlpha=o.alpha;
+  g.drawImage(t,0,0,sw,G.h,x,y,sw*cell,h);
+  g.restore();
+  return {x,y,w,h};
+}
+function vText(g,str,o){
+  g.save();
+  g.font=`${o.weight||'bold'} ${o.size||120}px ${o.font||F_SANS}`;
+  g.fillStyle=o.color||'#fff'; g.textAlign=o.align||'left'; g.textBaseline=o.base||'alphabetic';
+  g.letterSpacing=(o.ls||0)+'px';
+  if(o.alpha!=null) g.globalAlpha=o.alpha;
+  if(o.stroke){ g.strokeStyle=o.stroke; g.lineWidth=o.lw||3; g.strokeText(str,o.x,o.y); }
+  if(!o.outlineOnly) g.fillText(str,o.x,o.y);
+  g.restore();
+}
+function textW(g,str,size,weight='bold',font=F_SANS){
+  g.save(); g.font=`${weight} ${size}px ${font}`; const w=g.measureText(str).width; g.restore(); return w;
+}
+/* ---- 逐像素的收尾：颗粒 + 暗角。风格的后处理都放这里 ---- */
+function post(src,dst,S,o={}){
+  const W=src.width,H=src.height, sg=src.getContext('2d'), dg=wipe(dst.getContext('2d'));
+  const grain=(o.grain??0)*(S.grain??1), vig=o.vig??0, lift=o.lift??0;
+  if(!grain && !vig && !lift){ dg.drawImage(src,0,0); return; }
+  const id=sg.getImageData(0,0,W,H), d=id.data, cx=(W-1)/2, cy=(H-1)/2;
+  let z=hash(S.seed,'grain',S.f)|0;
+  for(let y=0;y<H;y++){
+    const ny=(y-cy)/cy;
+    for(let x=0;x<W;x++){
+      const i=(y*W+x)*4, nx=(x-cx)/cx, r2=nx*nx+ny*ny;
+      z=(Math.imul(z,1664525)+1013904223)|0;
+      const gn=((z>>>24)/255-0.5)*grain, v=1-vig*Math.pow(r2*0.5,1.4);
+      d[i]  =clamp(d[i]  *v+gn+lift,0,255);
+      d[i+1]=clamp(d[i+1]*v+gn+lift,0,255);
+      d[i+2]=clamp(d[i+2]*v+gn+lift,0,255);
+    }
+  }
+  dg.putImageData(id,0,0);
+}
+/* ---- 相机的推拉：在对数空间插值，否则近端冲、远端爬 ---- */
+function camPush(g,t,from,to,tx=0,ty=0){
+  const z=Math.exp(lerp(Math.log(from),Math.log(to),t));
+  g.translate(CX+tx, CY+ty); g.scale(z,z); g.translate(-CX,-CY);
+}
+/* ---- 发光：一层密实的内芯 + 一层很淡的大光晕，一层模糊是扁的 ---- */
+function glowText(g,str,o){
+  const core=o.core||'#fff', halo=o.halo||'#3f3';
+  g.save();
+  g.font=`${o.weight||'bold'} ${o.size}px ${o.font||F_MONO}`;
+  g.textAlign=o.align||'left'; g.textBaseline=o.base||'alphabetic';
+  g.globalAlpha=(o.alpha??1)*0.16; g.fillStyle=halo;
+  for(const [dx,dy] of [[-6,0],[6,0],[0,-6],[0,6],[-4,-4],[4,4],[-4,4],[4,-4]]) g.fillText(str,o.x+dx,o.y+dy);
+  g.globalAlpha=(o.alpha??1)*0.35; g.fillText(str,o.x,o.y);
+  g.globalAlpha=o.alpha??1; g.fillStyle=core; g.fillText(str,o.x,o.y);
+  g.restore();
+}
+
+/* =====================================================================
+   引擎：分镜（plate）是时间轴上的段落，每一帧由「全局帧号」定位
+   ===================================================================== */
+const PLATES=[];
+function plate(name,opts,fn){
+  if(PLATES.some(p=>p.name===name)) console.warn(`重名分镜：${name}`);
+  PLATES.push(Object.assign({name,fn},opts));
+}
+function TOTAL(){ return PLATES.reduce((a,p)=>a+p.len,0); }
+function locate(n){
+  let acc=0;
+  for(let i=0;i<PLATES.length;i++){ if(n<acc+PLATES[i].len) return {idx:i,local:n-acc}; acc+=PLATES[i].len; }
+  const i=PLATES.length-1; return {idx:i,local:PLATES[i].len-1};
+}
+/* at('sea',2)：sea 这段第 2 拍对应的全局帧。跨切口的连续性靠它，
+   而不是靠写死的帧号 —— 插入一段不会动到邻居。 */
+function at(name,x=0){
+  let acc=0;
+  for(const p of PLATES){ if(p.name===name) return Math.round(acc+x*BEAT); acc+=p.len; }
+  throw new Error(`at()：没有叫 ${name} 的分镜`);
+}
+const CUES=[['ink',2,'sunrise'],['pixel',0,'dive'],['pixel',8,'set'],['type',0,'block'],['phos',0,'burn']];
+function cue(name){
+  const c=CUES.find(c=>c[2]===name);
+  if(!c) throw new Error(`cue()：没有叫 ${name} 的提示点`);
+  return at(c[0],c[1]);
+}
+/* 段落之间的接缝：默认压黑。硬切的分镜自己设 cutIn/cutOut:false */
+function cut(g,S,amt){
+  g.save(); g.setTransform(1,0,0,1,0,0);
+  g.fillStyle=`rgba(0,0,0,${amt})`; g.fillRect(0,0,g.canvas.width,g.canvas.height); g.restore();
+}
+
+let DEPTH=0;   // 嵌套渲染深度：联系表渲染一格时是 1，正常渲染是 0
+
+function renderFrame(n,width,seed,target){
+  n=((n%TOTAL())+TOTAL())%TOTAL();
+  const W=Math.round(width); let H=Math.round(W/AR); if(H%2) H++;   // 偶数高度，libx264 要
+  /* 嵌套渲染（联系表里的格子）必须用另一块内容画布，
+     否则会把外层正在画的那块 resize 掉、当场擦干净 */
+  const cv=cvs(DEPTH?'content@'+DEPTH:'content',W,H), g=wipe(cv.getContext('2d')), sc=W/LW;
+  const {idx,local}=locate(n), P=PLATES[idx];
+  const S={ f:n, i:local, t:local/P.len, len:P.len, g, cv, sc, seed, W:LW, H:LH, name:P.name,
+            post:{}, grain:1,
+            b:rng(hash(seed,'b',P.name,Math.floor(n/3))),   // 每 3 帧重掷：活线的抖动
+            nz:rng(hash(seed,'nz',n)) };                     // 每帧重掷：噪声场
+  const R=rng(hash(seed,'plate',P.name));                    // 整段稳定：构图
+  g.fillStyle='#000'; g.fillRect(0,0,W,H);
+  g.setTransform(sc,0,0,sc,0,0);
+  g.imageSmoothingEnabled=true;
+  DEPTH++;
+  try{ P.fn(S,R); } finally { DEPTH--; }
+  const edgeIn=local, edgeOut=P.len-1-local;
+  if(P.cutIn!==false && edgeIn<4) cut(g,S,1-edgeIn/4);
+  else if(P.cutOut!==false && edgeOut<3) cut(g,S,1-edgeOut/3);
+  g.setTransform(1,0,0,1,0,0);
+  if(target.width!==W||target.height!==H){ target.width=W; target.height=H; }
+  post(cv,target,S,S.post);
+  return S;
+}
+
+/* 联系表：一格一帧，2 倍尺寸渲染再缩下来，逐像素后处理才不作假 */
+function contactSheet(n,cellW,seed,target,f0=0,f1=TOTAL()-1){
+  const cols=AR>=1?6:8, rows=Math.ceil(n/cols), cellH=Math.round(cellW/AR), lab=26, gap=8;
+  const SW=cols*(cellW+gap)+gap, SH=rows*(cellH+lab+gap)+gap;
+  target.width=SW; target.height=SH;
+  const g=wipe(target.getContext('2d'));
+  g.fillStyle='#181818'; g.fillRect(0,0,SW,SH);
+  const tmp=cvs('cell',cellW*2,Math.round(cellW*2/AR));
+  for(let i=0;i<n;i++){
+    const f=n>1?Math.round(f0+i*(f1-f0)/(n-1)):f0;
+    const S=renderFrame(f,cellW*2,seed,tmp);
+    const x=gap+(i%cols)*(cellW+gap), y=gap+Math.floor(i/cols)*(cellH+lab+gap);
+    g.drawImage(tmp,x,y,cellW,cellH);
+    g.fillStyle='#ddd'; g.font='12px ' + F_MONO; g.textBaseline='top';
+    g.fillText(`f=${f}  ${S.name}  t=${S.t.toFixed(2)}  ${(f/FPS).toFixed(1)}s`,x+2,y+cellH+6);
+  }
+}
+
+/* =====================================================================
+   分镜 1 · 墨（0.0-6.0s，180 帧 = 3 小节）
+   空白纸上，一条线把自己画成一座山、一片水、一条船。
+   ===================================================================== */
+plate('ink',{len:3*BAR,cutIn:false},(S,R)=>{
+  const g=S.g, HZ=LH*0.635;                      // 地平线
+  const P=S.t;                                   // 这一段的进度
+  /* 画纸 */
+  g.fillStyle=INK.paper; g.fillRect(-200,-200,LW+400,LH+400);
+  /* 纸的纤维：几条极淡的横纹 */
+  g.save(); g.globalAlpha=0.06; g.strokeStyle=INK.mid; g.lineWidth=1;
+  const fr=rng(hash(S.seed,'fiber'));
+  for(let i=0;i<26;i++){ const y=fr.r(0,LH); g.beginPath(); g.moveTo(0,y); g.lineTo(LW,y+fr.r(-6,6)); g.stroke(); }
+  g.restore();
+
+  /* 相机：开画时略远，慢慢推近 */
+  g.save(); camPush(g,ease.io(P),1.10,1.02,0,-LH*0.01);
+
+  /* --- 远山：两层，后面一层淡 --- */
+  const mtn1=ridgePts(-140,LW+140,HZ-6,LH*0.46,rng(hash(S.seed,'m1')),74);
+  const mtn2=ridgePts(-140,LW+140,HZ+2,LH*0.26,rng(hash(S.seed,'m2')),58);
+  const drawRidge=(pts,o)=>{
+    const b=rng(hash(S.seed,'jb',o.k,Math.floor(S.f/3)));
+    const jb=boil(pts,b,o.jit||1.6);
+    inkLine(g,jb,{color:o.color,w:o.w,reveal:o.rev,alpha:o.alpha});
+    if(o.hatch>0){                                  // 排线只在山体内
+      g.save(); g.beginPath();
+      g.moveTo(jb[0][0],jb[0][1]);
+      for(const p of jb) g.lineTo(p[0],p[1]);
+      g.lineTo(LW+140,LH+100); g.lineTo(-140,LH+100); g.closePath(); g.clip();
+      hatch(g,-140,0,LW+140,LH,o.hatchSpace||9,-Math.PI/4,{color:o.color,w:1.0,alpha:o.hatchAlpha});
+      /* 山脚再来一层更密的线：版画的体积感全靠"越往下越密" */
+      g.save(); g.beginPath(); g.rect(-140,o.baseY??HZ,LW+280,LH+100); g.clip();
+      hatch(g,-140,0,LW+140,LH,Math.max(3.4,(o.hatchSpace||9)*0.42),-Math.PI/4,{color:o.color,w:1.0,alpha:o.hatchAlpha*0.85});
+      g.restore();
+      g.restore();
+    }
+  };
+  const revFar=clamp((P-0.06)/0.30), revNear=clamp((P-0.18)/0.34);
+  drawRidge(mtn1,{k:'far',color:INK.mid,w:1.8,rev:ease.io(revFar),alpha:0.75,hatch:0.55*clamp((P-0.30)/0.3),hatchAlpha:0.24,hatchSpace:11,baseY:HZ-LH*0.13});
+  drawRidge(mtn2,{k:'near',color:INK.ink,w:2.6,rev:ease.io(revNear),alpha:1,hatch:0.7*clamp((P-0.34)/0.3),hatchAlpha:0.34,hatchSpace:8,baseY:HZ-LH*0.07});
+
+  /* --- 太阳：朱砂，开场第一件事就是"盖"下来（印章式的落法），
+     再慢慢升到山脊之上——第一帧就得有东西看 --- */
+  const sunP=clamp((S.f+3)/9);
+  if(sunP>0.001){
+    const rise=ease.out4(span(S.f,at('ink',1)-5,at('ink',2)+6));
+    const stamp=1+Math.pow(1-ease.out4(sunP),1.6)*0.30;      // 从 1.30 收到 1.00
+    const sunX=LW*0.735, sunY=HZ-LH*0.10-lerp(-LH*0.16,0,rise), sunR=LH*0.083*stamp;
+    g.save(); g.globalAlpha=lerp(0.25,1,ease.out4(sunP));
+    g.beginPath(); g.arc(sunX,sunY,sunR,0,6.283); g.clip();
+    g.fillStyle=INK.accent; g.globalAlpha*=0.85; g.fillRect(sunX-sunR-2,sunY-sunR-2,sunR*2+4,sunR*2+4);
+    g.globalAlpha*=0.5; g.strokeStyle=INK.paper; g.lineWidth=3;   // 版画式横割
+    for(let i=-4;i<=4;i++){ const y=sunY+i*sunR*0.24; g.beginPath(); g.moveTo(sunX-sunR,y); g.lineTo(sunX+sunR,y); g.stroke(); }
+    g.restore();
+  }
+
+  /* --- 水面：版画表现水的办法是"一组水平线"——近处疏而长，远处密而细。
+     每行的线段几何先算死，揭示靠一个从左往右扫的裁剪框，
+     这样线段在揭示过程中不会滑动、不会重排。 --- */
+  const revWater=clamp((P+0.055)/0.25);
+  const rows=[];
+  {
+    const rr=rng(hash(S.seed,'rows'));
+    for(let i=0;i<30;i++){
+      const u=i/29;
+      rows.push({ u, y:HZ+5+Math.pow(u,1.55)*(LH-HZ-11), seed:rr.i(1e6) });
+    }
+  }
+  const sweep=(from,to)=>{ const k=clamp(from/to); return k; };
+  g.save(); g.strokeStyle=INK.ink; g.lineCap='round';
+  for(const row of rows){
+    const pr=sweep(revWater-row.u*0.62,0.38);            // 远行先出现，逐行往下推
+    if(pr<=0.01) continue;
+    const wb=rng(hash(S.seed,'wl',row.seed));
+    const xEnd=-140+ease.io(pr)*(LW+340);
+    g.save(); g.beginPath(); g.rect(-160,-200,xEnd+160,LH+400); g.clip();
+    g.globalAlpha=lerp(0.78,0.26,Math.pow(row.u,0.75));
+    g.lineWidth=lerp(1.3,3.8,Math.pow(row.u,0.7));
+    let x=-wb.r(20,200);
+    while(x<LW+60){
+      const len=lerp(90,340,row.u)*wb.r(0.4,1.5);
+      const gap=lerp(14,110,row.u)*wb.r(0.35,1.7);
+      const wob=wb.r(-1.6,1.6);
+      g.beginPath(); g.moveTo(x,row.y);
+      g.quadraticCurveTo(x+len*0.5,row.y+wob,x+len,row.y);
+      g.stroke();
+      x+=len+gap;
+    }
+    g.restore();
+  }
+  /* 浪尖：稀稀几笔小弧，给水面一点"起"的动作 */
+  g.globalAlpha=0.5;
+  const cr=rng(hash(S.seed,'curl'));
+  for(let i=0;i<9;i++){
+    const u=cr.r(0.05,0.85), y=HZ+5+Math.pow(u,1.55)*(LH-HZ-11), x=cr.r(0,LW), r0=lerp(6,22,u);
+    if(clamp((revWater-u*0.62)/0.38)<=0.02) continue;
+    g.lineWidth=lerp(1.2,3,u);
+    g.beginPath(); g.arc(x,y,r0,-Math.PI*0.95,-Math.PI*0.15); g.stroke();
+  }
+  g.restore();
+
+  /* --- 一条小船：越过地平线，随浪起伏 --- */
+  const boatP=clamp((P-0.45)/0.5);
+  if(boatP>0.001){
+    const bx=lerp(-80,LW*0.30,ease.io(boatP)), bob=Math.sin(S.f*0.11)*LH*0.006;
+    const by=HZ+LH*0.115+bob, rv=ease.out4(span(P,0.45,0.75));
+    g.save(); g.translate(bx,by);
+    const hull=[[-58,0],[58,0],[40,20],[-40,20],[-58,0]];
+    inkLine(g,boil(hull,S.b,0.7),{color:INK.ink,w:3,reveal:rv,cap:'butt'});
+    inkLine(g,[[0,0],[0,-64]],{color:INK.ink,w:2.6,reveal:clamp(rv*1.4)});
+    const sail=[[2,-60],[46,-12],[2,-12],[2,-60]];
+    g.save(); g.globalAlpha=0.20; g.fillStyle=INK.ink;
+    g.beginPath(); g.moveTo(sail[0][0],sail[0][1]); for(const p of sail) g.lineTo(p[0],p[1]); g.closePath(); g.fill(); g.restore();
+    inkLine(g,boil(sail,S.b,0.9),{color:INK.ink,w:2.2,reveal:clamp((rv-0.35)/0.65)});
+    g.restore();
+  }
+
+  /* --- 芦苇：左下角，同一阵风 --- */
+  const gust=Math.sin(S.f*0.045)*0.5+Math.sin(S.f*0.017+1.2)*0.5;
+  g.save();
+  const rb=rng(hash(S.seed,'reed'));
+  for(let i=0;i<9;i++){
+    const x=rb.r(-40,LW*0.16), h=rb.r(LH*0.18,LH*0.42), bend=gust*rb.r(20,54);
+    const pts=[[x,LH+20]];
+    for(let k=1;k<=6;k++){ const u=k/6; pts.push([x+bend*u*u+rb.r(-3,3), LH+20-h*u]); }
+    inkLine(g,pts,{color:INK.ink,w:rb.r(1.8,3.4),reveal:clamp((P-0.30)/0.35),alpha:0.9});
+  }
+  g.restore();
+
+  /* --- 一只鸟 --- */
+  const birdP=clamp((P-0.5)/0.45);
+  if(birdP>0.01 && birdP<0.995){
+    const bx=lerp(-60,LW+60,ease.io(birdP)), by=LH*0.20+Math.sin(S.f*0.05)*LH*0.03;
+    const flap=Math.sin(S.f*0.32)*10;
+    g.save(); g.strokeStyle=INK.ink; g.lineWidth=2.6; g.lineCap='round';
+    g.beginPath(); g.moveTo(bx-16,by+flap); g.lineTo(bx,by); g.lineTo(bx+16,by+flap); g.stroke();
+    g.restore();
+  }
+  g.restore();
+
+  /* --- 标题：打字机逐字出现 --- */
+  const tp=span(S.f,at('ink',2)-6,at('ink',3)-10);
+  if(tp>0.001){
+    const full='每一帧，都是时间的函数';
+    const nch=Math.floor(ease.io(tp)*full.length*1.35);
+    const txt=full.slice(0,Math.min(full.length,nch));
+    const size=Math.min(LH*0.072,LW*0.045);
+    g.save();
+    g.font=`500 ${size}px ${F_CJK}`; g.textAlign='center'; g.textBaseline='alphabetic';
+    const cy=TITLE_Y*LH, cx=CX;
+    const w=textW(g,txt,size,'500',F_CJK);
+    const sp=ease.out4(span(S.f,at('ink',3)-14,at('ink',3)-2));
+    /* 题签：字底下垫一条纸色横带 + 上下两根细线。
+       水面全是横线，字直接压上去读不清——版画本来也是这么处理的。 */
+    {
+      const pad=size*0.55, bandH=size*1.58, bandY=cy-size*1.04;
+      const bx0=cx-w/2-pad, bx1=cx+w/2+pad+size*1.5*sp;
+      const bIn=ease.out4(clamp(tp*4.5));
+      g.save(); g.globalAlpha=0.96*bIn*(0.35+0.65*clamp(sp*4+0.4));
+      g.fillStyle=INK.paper; g.fillRect(bx0,bandY,bx1-bx0,bandH); g.restore();
+      g.save(); g.globalAlpha=0.42*bIn; g.strokeStyle=INK.mid; g.lineWidth=1.3;
+      g.beginPath(); g.moveTo(bx0,bandY+1); g.lineTo(bx1,bandY+1);
+      g.moveTo(bx0,bandY+bandH-1); g.lineTo(bx1,bandY+bandH-1); g.stroke(); g.restore();
+    }
+    g.fillStyle=INK.ink;
+    g.fillText(txt,cx,cy);
+    if(nch<full.length && Math.floor(S.f/8)%2===0){    // 打字机光标
+      g.fillRect(cx+w/2+size*0.08,cy-size*0.78,size*0.075,size*0.86);
+    }
+    /* 一枚朱砂小印，落款 */
+    if(sp>0.01){
+      g.globalAlpha=sp*0.92; g.fillStyle=INK.accent;
+      const bx=cx+w/2+size*0.9, by=cy-size*0.86, bs=size*0.86;
+      g.fillRect(bx,by,bs,bs);
+      g.globalAlpha=sp; g.fillStyle=INK.paper;
+      g.font=`600 ${bs*0.62}px ${F_CJK}`; g.textAlign='center'; g.textBaseline='middle';
+      g.fillText('帧',bx+bs/2,by+bs*0.54);
+    }
+    g.restore();
+  }
+  S.post.grain=7; S.post.vig=0.30;
+});
+
+/* =====================================================================
+   分镜 2 · 像素（6.0-13.0s，210 帧 = 3.5 小节）
+   240x135，16 色，整数倍放大。日落、海、一条小船。
+   约束本身就是风格：低分辨率 + 固定调色板，拿走了模型最不会做的那些决定。
+   ===================================================================== */
+plate('pixel',{len:210,cutIn:false},(S,R)=>{
+  const g=S.g, PW=240, PH=135, SC=8;            // 240*8=1920, 135*8=1080，整除
+  const pgc=cvs('pix',PW,PH), pg=wipe(pgc.getContext('2d'));   // pgc 是画布，pg 是它的上下文
+  pg.imageSmoothingEnabled=false;
+  const P=S.t, HZ=78;
+  const beat=Math.floor(S.i/BEAT), inBeat=(S.i%BEAT)/BEAT;
+  const pulse=1-Math.exp(-6*inBeat);            // 每拍一次的脉冲，衰减到 0
+
+  /* --- 天：5 段渐变 + 有序抖动，像素画的标准做法 --- */
+  const sky=['#29366f','#5d275d','#b13e53','#ef7d57','#ffcd75'];
+  for(let y=0;y<HZ;y++){
+    const v=Math.pow(y/HZ,0.85)*(sky.length-1);
+    const i=Math.min(sky.length-2,Math.floor(v)), fr=v-i;
+    for(let x=0;x<PW;x++){
+      const idx=bayer(x,y)<fr?i+1:i;
+      pg.fillStyle=sky[idx]; pg.fillRect(x,y,1,1);
+    }
+  }
+  /* --- 星星：日落之后才出来 --- */
+  const night=clamp((P-0.55)/0.35);
+  if(night>0.01){
+    const sr=rng(hash(S.seed,'stars'));
+    for(let i=0;i<90;i++){
+      const x=sr.i(PW), y=sr.i(HZ*0.72), tw=sr.r(0.4,1);
+      const a=clamp((night-tw*0.9)*2.2)*Math.max(0.25,Math.sin(S.f*0.06+i)*0.5+0.5);
+      if(a<=0.05) continue;
+      pg.globalAlpha=a; pg.fillStyle=tw>0.75?'#f4f4f4':'#94b0c2';
+      pg.fillRect(x,y,1,1); pg.globalAlpha=1;
+    }
+  }
+  /* --- 太阳：慢慢落下去；边缘用抖动做"像素抗锯齿" --- */
+  const sunP=ease.io(clamp(P/0.92));
+  const sunX=Math.round(PW*0.44), sunY=Math.round(lerp(40,92,sunP));
+  const sunR=Math.round(15+pulse*1.2);
+  /* 光晕：外侧两层很淡的暖色，让太阳不是贴上去的 */
+  for(let y=-sunR-3;y<=sunR+3;y++)for(let x=-sunR-3;x<=sunR+3;x++){
+    const d2=x*x+y*y, px=sunX+x, py=sunY+y;
+    if(d2<=sunR*sunR||py<0||py>=PH||px<0||px>=PW) continue;
+    if(d2<=(sunR+1.5)*(sunR+1.5)&&bayer(px,py)<0.55){ pg.fillStyle='#ef7d57'; pg.fillRect(px,py,1,1); }
+    else if(d2<=(sunR+3)*(sunR+3)&&bayer(px,py)<0.22){ pg.fillStyle='#b13e53'; pg.fillRect(px,py,1,1); }
+  }
+  for(let y=-sunR-1;y<=sunR+1;y++)for(let x=-sunR-1;x<=sunR+1;x++){
+    const d2=x*x+y*y, px=sunX+x, py=sunY+y;
+    if(d2>sunR*sunR||py<0||py>=PH||px<0||px>=PW) continue;
+    if(d2>(sunR-1)*(sunR-1)&&bayer(px,py)<0.45) continue;   // 外一圈打散
+    pg.fillStyle='#ffcd75'; pg.fillRect(px,py,1,1);
+  }
+  /* --- 海：五档颜色 + 抖动过渡；浪是 1-3 px 的短横线，越近越稀越暗 --- */
+  const stops=[[0.00,'#ffcd75'],[0.05,'#ef7d57'],[0.11,'#b13e53'],[0.24,'#5d275d'],[0.52,'#29366f'],[1.00,'#1a1c2c']];
+  for(let y=HZ;y<PH;y++){
+    const u=(y-HZ)/(PH-HZ);
+    let i=0; while(i<stops.length-2 && u>stops[i+1][0]) i++;
+    const t=(u-stops[i][0])/Math.max(1e-6,stops[i+1][0]-stops[i][0]);
+    pg.fillStyle=(bayer(0,y)<clamp(t)?stops[i+1][1]:stops[i][1]);
+    pg.fillRect(0,y,PW,1);
+    /* 浪：每一行有自己的相位，横着走，看着像水面在动 */
+    const dens=lerp(0.36,0.09,Math.pow(u,0.55)), step=Math.round(lerp(2,5,u));
+    for(let x=0;x<PW;x+=step){
+      const h=hash(S.seed,'wave',x,y*3);
+      const ph=(h%1000)/1000;
+      const wob=Math.sin(x*0.09+S.f*0.10+y*0.7)*0.5+0.5;
+      if(ph*0.78+wob*0.22<dens){
+        const dl=1+((h>>>10)%3);
+        pg.fillStyle=u<0.16?'#ffcd75':(u<0.40?'#ef7d57':(u<0.70?'#3b5dc9':'#41a6f6'));
+        pg.fillRect(x,y,dl,1);
+      }
+    }
+  }
+  /* --- 水面上太阳的反光：一条随深度散开的暖色柱，被浪打断 --- */
+  for(let y=HZ+1;y<PH-6;y++){
+    const u=(y-HZ)/(PH-HZ), w=Math.round(lerp(3,22,u*u));
+    const off=Math.round(Math.sin(S.f*0.07+y*0.55)*3*u);
+    const gv=((hash(S.seed,'refl',y)%100)/100);
+    pg.globalAlpha=(0.62*(1-u*0.8))*(0.5+0.5*gv);
+    pg.fillStyle=u<0.45?'#ffcd75':(u<0.78?'#ef7d57':'#b13e53');
+    pg.fillRect(sunX-w/2+off,y,Math.max(1,w-(gv<0.4?2:0)),1); pg.globalAlpha=1;
+  }
+  /* --- 小船 --- */
+  const boatX=Math.round(lerp(60,150,ease.io(clamp((P-0.05)/0.9))));
+  const boatY=Math.round(HZ+8+Math.sin(S.f*0.09)*1.6);
+  pg.fillStyle='#1a1c2c';
+  pg.fillRect(boatX-1,boatY-9,1,8);
+  for(let y=0;y<5;y++){ const w=Math.round(9-y*1.4); pg.fillRect(boatX-w,boatY-3+y,w*2,1); }
+  pg.fillRect(boatX+1,boatY-9,5,4);
+  /* --- 海鸟 --- */
+  const br=rng(hash(S.seed,'birds'));
+  for(let i=0;i<5;i++){
+    const sp=br.r(0.7,1.6), y0=br.r(14,34);
+    const x=Math.round(((S.f*sp*0.55+br.r(0,300))%(PW+40))-20);
+    const flap=Math.sin(S.f*0.3+i*1.7)>0?-1:1;
+    pg.fillStyle='#1a1c2c';
+    pg.fillRect(x,y0+ (flap>0?0:1),1,1); pg.fillRect(x-2,y0,1,1); pg.fillRect(x+2,y0,1,1);
+  }
+  /* --- 前景剪影：芦苇丛，压住左下的构图 --- */
+  pg.fillStyle='#1a1c2c';
+  const rr=rng(hash(S.seed,'reed'));
+  for(let i=0;i<16;i++){
+    const x0=rr.i(Math.round(PW*0.28)), h=rr.r(14,44), bend=Math.sin(S.f*0.045)*4;
+    for(let k=0;k<h;k++){
+      const u=k/h, x=Math.round(x0+bend*u*u);
+      pg.fillRect(x,PH-1-k,1,1);
+      if(k%5===0&&u>0.35){ pg.fillRect(x+(rr.f()<0.5?-1:1),PH-1-k,1,1); }
+    }
+  }
+  /* --- OSD：右下角的时间码，像录像带 --- */
+  pg.font='6px ' + F_MONO; pg.textBaseline='top';
+  pg.fillStyle='#f4f4f4';
+  pg.fillText(`FRAME ${pad(S.f,4)}`,PW-58,PH-9);
+  pg.fillStyle=(Math.floor(S.f/15)%2?'#ef7d57':'#5d275d');
+  pg.fillRect(PW-11,PH-9,4,4);
+
+  /* --- 上屏：整数倍放大，再糊一层 CRT --- */
+  const full=cvs('pixfull',LW,LH), fg=wipe(full.getContext('2d'));
+  fg.imageSmoothingEnabled=false;
+  fg.drawImage(pgc,0,0,PW,PH,0,0,PW*SC,PH*SC);
+  /* 桶形：按 6px 一条重画，上下两条往里挤，中间不动 —— 比逐像素重采样便宜得多 */
+  const strip=6, push=(AR>=1?1.1:1.6)+pulse*0.7;
+  for(let y=0;y<LH;y+=strip){
+    const v=(y/LH-0.5)*2;
+    g.drawImage(full,0,y,LW,strip, -v*v*push*8, y, LW, strip);
+  }
+  /* 色散：红蓝各偏一点，用 screen 叠上去 */
+  const tint=(col)=>{ const t=cvs('tintfull',LW,LH), tg=wipe(t.getContext('2d'));
+    tg.drawImage(full,0,0); tg.globalCompositeOperation='source-in'; tg.fillStyle=col; tg.fillRect(0,0,LW,LH); return t; };
+  g.save(); g.globalCompositeOperation='screen'; g.globalAlpha=0.13;
+  g.drawImage(tint('#ff0000'),1.5,0); g.drawImage(tint('#0044ff'),-1.5,0); g.restore();
+  /* 亮部溢出：一次模糊，便宜 */
+  scanlines(g,0,0,LW,LH,3,0.16,'#000');
+  g.save(); g.globalAlpha=0.05+night*0.05; g.fillStyle='#8fd0ff'; g.fillRect(0,0,LW,LH); g.restore();
+  S.post.grain=8; S.post.vig=0.42;
+});
+
+/* =====================================================================
+   分镜 3 · 排版（13.0-19.0s，180 帧 = 3 小节）
+   瑞士海报：白纸、黑字、一色红。十二拍，六张卡片，硬切换卡。
+   ===================================================================== */
+plate('type',{len:3*BAR,cutIn:false},(S,R)=>{
+  const g=S.g;
+  const beat=Math.floor(S.i/BEAT), inBeat=(S.i%BEAT)/BEAT;      // 第几拍
+  const card=Math.floor(beat/2), ct=(beat%2+inBeat)/2;          // 第几张卡，卡内进度 0..1
+  const hit=1-Math.exp(-7*inBeat);                              // 每拍一次的冲击
+  g.fillStyle=POS.bg; g.fillRect(-100,-100,LW+200,LH+200);
+  const M=LH*SAFE;
+  /* 版心网格：极细的灰线，一直在 */
+  g.save(); g.globalAlpha=0.16; g.strokeStyle=POS.mid; g.lineWidth=1;
+  for(let i=1;i<12;i++){ const x=LWi(i/12); g.beginPath(); g.moveTo(x,0); g.lineTo(x,LH); g.stroke(); }
+  for(let i=1;i<6;i++){ const y=LH*i/6; g.beginPath(); g.moveTo(0,y); g.lineTo(LW,y); g.stroke(); }
+  g.restore();
+  function LWi(u){ return LW*u; }
+
+  if(card===0){                       /* 大幅滑动 + 朱红块擦过 */
+    const p=ease.outExpo(clamp(ct/0.55));
+    const size=Math.min(LH*0.30,LW*0.20);
+    const x=lerp(-LW*0.75,LW*0.10,p);
+    const w=textW(g,'EVERY',size,'bold',F_SANS);
+    g.save(); g.globalAlpha=0.92; g.fillStyle=POS.red;
+    const bp=ease.io(clamp((ct-0.15)/0.4));
+    g.fillRect(LW*0.10-LH*0.02, CY-size*0.36, (w+LH*0.06)*bp, size*0.98); g.restore();
+    vText(g,'EVERY',{x,y:CY+size*0.36,size,color:p>0.98?POS.white:POS.ink,ls:-size*0.03});
+    pixText(g,'01 / 06   每一帧都是时间的函数',{x:M,y:LH-M,px:14,cell:4,fit:LW-2*M,color:POS.mid,base:'bottom'});
+  }
+  else if(card===1){                  /* 弹入 + 网点底 */
+    const p=spring(S.i-BEAT*2,0.34,0.30);
+    const size=Math.min(LH*0.26,LW*0.17)*(1.14-0.14*p);
+    halftone(g,0,0,LW,LH,Math.round(lerp(30,14,p)),POS.red,0.20+0.25*p);
+    vText(g,'FRAME',{x:CX,y:CY+size*0.35,size,align:'center',color:POS.ink,ls:size*0.10});
+    g.save(); g.fillStyle=POS.red;
+    g.fillRect(CX-LW*0.30,CY+size*0.44,LW*0.60*(0.3+0.7*p),LH*0.012); g.restore();
+    pixText(g,'02 / 06   the picture is a function of t',{x:M,y:LH-M,px:14,cell:4,fit:LW-2*M,color:POS.mid,base:'bottom'});
+  }
+  else if(card===2){                  /* 空心 + 实心两行，换字闪烁 */
+    const p=ease.out4(clamp(ct/0.4));
+    const size=Math.min(LH*0.20,LW*0.13);
+    const FLIP='#@%&$?*+=<>';
+    const flick=(s,on)=>{ if(!on) return s;
+      const fr=rng(hash(S.seed,'flip',S.i));
+      return s.split('').map(ch=>fr.f()<0.34?FLIP[fr.i(FLIP.length)]:ch).join(''); };
+    const on=inBeat<0.18;
+    vText(g,flick('IS',on),{x:M,y:CY-size*0.55,size,color:POS.ink,outlineOnly:true,stroke:POS.ink,lw:3});
+    vText(g,flick('CODE',on),{x:M,y:CY+size*0.85,size,color:POS.ink,alpha:0.55+0.45*p});
+    g.save(); g.fillStyle=POS.red; g.fillRect(M,CY+size*1.15,LW*0.36*ease.out4(clamp((ct-0.2)/0.5)),LH*0.010); g.restore();
+    pixText(g,'03 / 06   no memory of the last frame',{x:M,y:LH-M,px:14,cell:4,fit:LW-2*M,color:POS.mid,base:'bottom'});
+  }
+  else if(card===3){                  /* 包豪斯：大红圆 + 巨字 */
+    const p=spring(S.i-BEAT*6,0.38,0.26);
+    const size=Math.min(LH*0.30,LW*0.20);
+    g.save(); g.globalAlpha=0.94; g.fillStyle=POS.red;
+    g.beginPath(); g.arc(LW*0.72,CY,LH*0.26*p,0,6.283); g.fill(); g.restore();
+    vText(g,'只是',{x:M,y:CY+size*0.34,size,color:POS.ink,font:F_CJK,weight:'700'});
+    pixText(g,'04 / 06   // t is the only input',{x:M,y:LH-M,px:14,cell:4,fit:LW-2*M,color:POS.mid,base:'bottom'});
+  }
+  else if(card===4){                  /* 逐字弹簧 + 进度条 */
+    const size=Math.min(LH*0.20,LW*0.13);
+    const s='时间的函数';
+    g.save(); g.font=`700 ${size}px ${F_CJK}`; g.textBaseline='alphabetic';
+    let x=M; const y=CY+size*0.34;
+    for(let i=0;i<s.length;i++){
+      const p=spring((S.i-BEAT*8)-i*3.2,0.40,0.26);
+      g.globalAlpha=clamp(p*1.3); g.fillStyle=POS.ink;
+      g.fillText(s[i],x,y-(1-p)*LH*0.18);
+      x+=g.measureText(s[i]).width+size*0.05;
+    }
+    g.restore();
+    const bw=(x-M)+LH*0.06, t=clamp(S.f/720);
+    g.save(); g.fillStyle='#00000022'; g.fillRect(M,CY+size*0.55,bw,size*0.09);
+    g.fillStyle=POS.red; g.fillRect(M,CY+size*0.55,bw*t,size*0.09); g.restore();
+    pixText(g,`05 / 06   t = ${(S.f/FPS).toFixed(2)}s   frame ${pad(S.f,3)} / ${TOTAL()}`,{x:M,y:LH-M,px:14,cell:4,fit:LW-2*M,color:POS.mid,base:'bottom'});
+  }
+  else{                               /* 三个 t，同一个函数 */
+    const size=Math.min(LH*0.075,LW*0.05);
+    const ts=[1.0,4.5,8.0], bw=(LW-2*M-LH*0.08)/3, bh=LH*0.40, by=LH*0.33, t0=S.i-BEAT*10;
+    /* 标题在上，图在下，标签再下——三段互不打架 */
+    const tp6=ease.out4(clamp(t0/(BEAT*0.8)));
+    g.save(); g.globalAlpha=tp6;
+    vText(g,'同一个函数，任意一秒',{x:CX,y:LH*0.235,size,align:'center',color:POS.ink,font:F_CJK,weight:'600'});
+    g.restore();
+    for(let i=0;i<3;i++){
+      const p=stagger(t0,BEAT*0.6,BEAT*0.9,i,3,0.5);
+      if(p<=0.001) continue;
+      const x=M+i*(bw+LH*0.04);
+      g.save(); g.globalAlpha=clamp(p*1.4);
+      g.fillStyle='#111111'; g.fillRect(x,by+ (1-ease.out4(p))*LH*0.03,bw,bh);
+      g.save(); g.beginPath(); g.rect(x,by,bw,bh); g.clip(); g.translate(x,by);
+      const T=ts[i], ph=T*1.7+t0*0.05;               // 三条曲线同相而不同时刻
+      g.strokeStyle=POS.red; g.lineWidth=3;
+      g.beginPath(); g.arc(bw*0.5,bh*(0.55+0.12*Math.sin(ph)),bh*0.16*(0.8+0.3*Math.cos(ph)),0,6.283); g.stroke();
+      g.fillStyle='#f2f0eb';
+      g.fillRect(bw*0.2,bh*0.82,bw*0.6*((T/8)%1+0.15),bh*0.03);
+      g.strokeStyle='#f2f0eb'; g.lineWidth=2;
+      g.beginPath();
+      for(let k=0;k<=40;k++){ const u=k/40; const yy=bh*0.5+Math.sin(u*6.283*2+ph)*bh*0.14; k?g.lineTo(bw*u,yy):g.moveTo(bw*u,yy); }
+      g.stroke(); g.restore(); g.restore();
+      pixText(g,`t = ${T.toFixed(1)}s`,{x:x,y:by+bh+LH*0.05,px:14,cell:4,color:POS.ink,base:'top'});
+    }
+    pixText(g,'06 / 06   seek anywhere, get the same picture',{x:M,y:LH-M,px:14,cell:4,fit:LW-2*M,color:POS.mid,base:'bottom'});
+  }
+  S.post.grain=5; S.post.vig=0.14;
+});
+
+/* =====================================================================
+   分镜 4 · 磷光（19.0-24.0s，150 帧 = 2.5 小节）
+   终端里把这部片子的源码打出来，字烧成粒子，最后落在全片的联系表上。
+   ===================================================================== */
+let SHEET=null, IN_SHEET=false;
+function buildSheet(cellW,seed){
+  /* 递归保护：联系表里的格子不许再画联系表（第 4 段的帧就在表里，
+     不挡住这一条就是无限递归）。表里的格子画成纯终端画面。 */
+  if(IN_SHEET) return null;
+  IN_SHEET=true;
+  const n=24, cols=6, rows=4, cellH=Math.round(cellW/AR), gap=6;
+  const c=cvs('sheet',cols*(cellW+gap)+gap,rows*(cellH+gap)+gap);
+  const cg=wipe(c.getContext('2d'));
+  cg.fillStyle='#04120a'; cg.fillRect(0,0,c.width,c.height);
+  const tmp=cvs('sheetcell',cellW,cellH);
+  for(let i=0;i<n;i++){
+    const f=Math.round(i*(TOTAL()-1)/(n-1));
+    renderFrame(f,cellW,seed,tmp);
+    cg.drawImage(tmp,gap+(i%cols)*(cellW+gap),gap+Math.floor(i/cols)*(cellH+gap));
+  }
+  IN_SHEET=false;
+  return {c,cellW,cellH,gap,cols,rows};
+}
+plate('phos',{len:150,cutIn:false,cutOut:false},(S,R)=>{
+  const g=S.g;
+  const T0=at('phos',0), TYPE=45, BURN=42, SHEET_IN=72;
+  const code=[
+    'const FPS = 30, BEAT = 15;      // 120 BPM',
+    '',
+    'function draw(t){               // t: 秒',
+    '  const S = state(t);           // 不看上一帧',
+    '  camera(S);  ink(S);',
+    '  pixels(S);  type(S);',
+    '  return frame;                 // 第 n 帧 = f(n)',
+    '}',
+    '',
+    '// seek 到任意一秒 -> 同一张画面',
+    '// 720 帧，没有一帧记得前一帧'
+  ];
+  const mono=Math.round(Math.min(LH*0.030,LW*0.017));
+  const lineH=mono*1.55, total=code.length;
+  const x0=LW*0.10, y0=CY-lineH*(total/2)+mono*0.6;
+
+  /* 背景：极暗的绿 + 一层缓慢的扫描辉光 */
+  g.fillStyle=PHO.bg; g.fillRect(-100,-100,LW+200,LH+200);
+  const sweep=((S.f*7)%(LH*1.6))-LH*0.3;
+  const grd=g.createLinearGradient(0,sweep-LH*0.25,0,sweep+LH*0.25);
+  grd.addColorStop(0,'rgba(40,180,80,0)'); grd.addColorStop(0.5,'rgba(60,220,110,0.055)'); grd.addColorStop(1,'rgba(40,180,80,0)');
+  g.fillStyle=grd; g.fillRect(0,0,LW,LH);
+
+  /* 逐字符的“打字”进度 */
+  const chars=code.reduce((a,s)=>a+s.length,0);
+  const typed=span(S.f,T0,T0+TYPE)*chars*1.15;
+  let seen=0;
+  const boxes=[];                       // 每个字的方框，烧散时用
+  g.save(); g.textBaseline='alphabetic';
+  /* 烧完之后正文要退场，否则会跟后面的联系表叠在一起。
+     但在联系表内部（IN_SHEET）不退场——那几个格子就该看见代码。 */
+  const txtA=IN_SHEET?1:(1-clamp((S.f-(T0+BURN-2))/20));
+  g.globalAlpha=clamp(txtA);
+  for(let li=0;li<total;li++){
+    const line=code[li], y=y0+li*lineH;
+    if(line===''){ continue; }
+    g.font=`600 ${mono}px ${F_MONO}`;
+    let li2;
+    for(li2=0; li2<line.length; li2++){
+      const my=seen+li2;
+      if(my>typed) break;
+      const ch=line[li2];
+      const cx=x0+g.measureText(line.slice(0,li2)).width;
+      if(ch!==' ') boxes.push({ch,x:cx,y:y-mono*0.78,w:mono*0.62,h:mono});
+    }
+    seen+=line.length;
+    const n=Math.max(0,Math.min(line.length,Math.floor(typed-(seen-line.length))));
+    if(n>0) glowText(g,line.slice(0,n),{x:x0,y,size:mono,font:F_MONO,core:PHO.hi,halo:PHO.lit,weight:'600',alpha:clamp(txtA)});
+    if(typed>seen-line.length && typed<seen && Math.floor(S.f/5)%2===0){
+      const cw2=g.measureText(line.slice(0,n)).width;
+      g.fillStyle=PHO.hi; g.fillRect(x0+cw2,y-mono*0.82,mono*0.55,mono);
+    }
+  }
+  g.restore(); g.globalAlpha=1;
+
+  /* 烧散：每个字化成小方块按闭式抛物线飞走，再用 3 个子帧采样做运动模糊。
+     方块只取字格内一小块——整格位移会在 burn 小的时候跟原字叠出双影。 */
+  const burn=span(S.f,T0+BURN,T0+BURN+26);
+  if(burn>0.001){
+    g.save();
+    const sz=mono*0.30;
+    for(const b of boxes){
+      const br=rng(hash(S.seed,'burn',b.ch,Math.round(b.x),Math.round(b.y)));
+      const vx=br.r(-260,260), vy=br.r(-460,-120);
+      const px0=b.x+br.r(0,b.w*0.8), py0=b.y+br.r(0,b.h*0.8);
+      for(let k=2;k>=0;k--){
+        const tau=burn*(0.55+k*0.10);
+        const px=px0+vx*tau, py=py0+vy*tau+900*tau*tau;
+        g.globalAlpha=clamp((1-burn*0.75))*(0.42-k*0.11);
+        g.fillStyle=k===0?PHO.hi:PHO.lit;
+        g.fillRect(px,py,sz,sz);
+      }
+    }
+    g.restore(); g.globalAlpha=1;
+  }
+
+  /* 全片的联系表：24 帧自己证明自己 */
+  const sIn=span(S.f,T0+SHEET_IN,T0+SHEET_IN+26);
+  if(sIn>0.001){
+    if(!SHEET && !IN_SHEET) SHEET=buildSheet(384,SEED);
+    const sh=SHEET;
+    if(sh){
+    const sw=LW*0.80, scale=sw/sh.c.width, sh2=sh.c.height*scale;
+    const ox=(LW-sw)/2, oy=CY-sh2/2+LH*0.04;
+    const fade=clamp((sIn-0.55)/0.45);
+    g.save();
+    g.globalAlpha=fade*clamp((1-((S.f-(T0+SHEET_IN+52))/22))*1.6)*0.96;
+    g.translate(ox,oy); g.scale(scale,scale);
+    /* 一格一格地落下来 */
+    const N=24;
+    for(let i=0;i<N;i++){
+      const p=stagger(S.f-(T0+SHEET_IN),0,20,i,N,0.85);
+      if(p<=0.01) continue;
+      const sx=sh.gap+(i%sh.cols)*(sh.cellW+sh.gap), sy=sh.gap+Math.floor(i/sh.cols)*(sh.cellH+sh.gap);
+      g.globalAlpha*=1;
+      g.save(); g.globalAlpha=fade*clamp((1-((S.f-(T0+SHEET_IN+52))/22))*1.6)*clamp(p*1.6);
+      g.drawImage(sh.c,sx,sy,sh.cellW,sh.cellH, sx,sy+ (1-p)*(sh.cellH*0.35), sh.cellW,sh.cellH);
+      g.restore();
+    }
+    g.restore(); g.globalAlpha=1;
+    /* 扫描线只在表上 */
+    g.save(); g.globalAlpha=0.14*fade; g.fillStyle='#000';
+    g.fillRect(ox,oy,sw,sh2); g.restore();
+    }
+  }
+
+  /* 尾字幕 */
+  const tIn=ease.out4(span(S.f,T0+112,T0+134));
+  if(tIn>0.001){
+    const size=Math.min(LH*0.062,LW*0.038);
+    g.save(); g.globalAlpha=tIn*0.96; g.fillStyle='#04120a'; g.fillRect(0,0,LW,LH); g.restore();
+    g.save(); g.globalAlpha=tIn;
+    glowText(g,'每一帧都是时间的函数',{x:CX,y:CY+size*0.34,size,align:'center',core:PHO.hi,halo:PHO.lit,font:F_CJK,weight:'600'});
+    glowText(g,`f(t)   reproduced  ${TOTAL()} / ${TOTAL()}`,{x:CX,y:CY+size*1.5,size:size*0.36,align:'center',core:PHO.lit,halo:PHO.mid,font:F_MONO,weight:'600'});
+    g.restore();
+    /* 最后淡回开头那一帧（而不是淡成空白纸）——首尾真正接上 */
+    const back=ease.io(span(S.f,T0+141,T0+150));
+    if(back>0&&DEPTH<=2){
+      const ow=Math.max(2,Math.round(LW*S.sc)), oh=Math.max(2,Math.round(LH*S.sc));
+      const lp=cvs('loop',ow,oh);
+      renderFrame(0,ow,SEED,lp);
+      g.save(); g.globalAlpha=back; g.drawImage(lp,0,0,LW,LH); g.restore();
+    }
+  }
+  S.post.grain=6+ (1-span(S.f,T0+112,T0+134))*4; S.post.vig=0.34;
+});
+
+/* =====================================================================
+   启动
+   ===================================================================== */
+const MAIN=document.getElementById('c');
+MAIN.getContext('2d',{willReadFrequently:true});
+window.RISO={
+  fps:FPS, bpm:BPM,
+  get total(){ return TOTAL(); },
+  get plates(){ return PLATES.map(p=>({name:p.name,len:p.len})); },
+  frame(n,width,seed){ renderFrame(n,width??WIDTH,seed??SEED,MAIN); return MAIN.toDataURL('image/png'); },
+  contact(n,cellW,f0,f1){ contactSheet(n||24,cellW||480,SEED,MAIN,f0??0,f1??TOTAL()-1); return MAIN.toDataURL('image/png'); },
+  curves(){ const start={}; let acc=0;
+    for(const p of PLATES){ start[p.name]=acc; acc+=p.len; }
+    return {fps:FPS,bpm:BPM,total:acc,start,
+            cues:CUES.map(([plate,beat,name])=>({name,plate,beat,f:at(plate,beat)}))}; },
+};
+function boot(){
+  if(Q.has('grid')){ contactSheet(+Q.get('grid')||24,+Q.get('cw')||480,SEED,MAIN,+(Q.get('from')||0),Q.has('to')?+Q.get('to'):TOTAL()-1); }
+  else if(Q.has('f')){ renderFrame(+Q.get('f')||0,WIDTH,SEED,MAIN); }
+  else{
+    let f=+(Q.get('from')||0), last=0;
+    const tick=(ts)=>{ if(ts-last>=1000/FPS){ last=ts; renderFrame(f++,Math.min(WIDTH,1280),SEED,MAIN); } requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  }
+  window.__ready=true;
+}
+if(document.fonts && document.fonts.ready) document.fonts.ready.then(boot); else window.addEventListener('load',boot);
+</script>
+</body>
+</html>

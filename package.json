@@ -1,0 +1,17 @@
+{
+  "name": "every-frame-is-a-function",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "一个 24 秒的代码动画：每一帧都是 (帧号, 种子, 宽度) 的纯函数。无素材、无图片、无 CDN。",
+  "scripts": {
+    "audio": "node audio.mjs",
+    "render": "node render.mjs frames 7",
+    "build": "./build.sh",
+    "shot": "node shot.mjs 0 180 390 570 719",
+    "sheet": "SHEET=shots/sheet.png SHEET_N=24 SHEET_W=460 node render.mjs frames 7"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
+}
