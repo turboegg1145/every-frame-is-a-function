@@ -24,8 +24,19 @@ const puppeteer = require('puppeteer-core');
 
 /* ---------- 找到 Chrome。优先用环境变量，其次 puppeteer 的缓存目录（最高版本） ---------- */
 function findChrome() {
-  if (process.env.CHROME) return process.env.CHROME;
-  const root = path.join(process.env.HOME || '', '.cache/puppeteer/chrome');
+  if (process.env.CHROME) return process.env.CHROME;          // ① 显式指定优先
+  if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
+  const HOME = process.env.HOME || '';
+  // ② 系统里正经装的那一个（apt / .deb / 用户级解包都认）
+  for (const p of [
+    '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/opt/google/chrome/chrome',
+    HOME + '/.local/bin/google-chrome', HOME + '/.local/bin/google-chrome-stable',
+    HOME + '/.local/opt/google-chrome-stable/opt/google/chrome/chrome',
+    '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium',
+    '/usr/bin/brave-browser', '/usr/bin/microsoft-edge',
+  ]) if (fs.existsSync(p)) return p;
+  // ③ 都没装，就用 puppeteer 下到缓存里的
+  const root = path.join(HOME, '.cache/puppeteer/chrome');
   if (fs.existsSync(root)) {
     // 目录名可能是 154.0.8037.57 也可能是 linux-154.0.8037.57：按版本号倒序
     const ver = d => (d.match(/\d+(\.\d+)+/) || ['0'])[0].split('.').map(Number);
@@ -34,18 +45,15 @@ function findChrome() {
       for (let i = 0; i < 4; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pb[i] || 0) - (pa[i] || 0);
       return 0;
     });
-    for (const v of vers) {
-      for (const bin of ['chrome-linux64/chrome', 'chrome-linux/chrome']) {
-        const p = path.join(root, v, bin);
-        if (fs.existsSync(p)) return p;
-      }
+    for (const v of vers) for (const bin of ['chrome-linux64/chrome', 'chrome-linux/chrome']) {
+      const p = path.join(root, v, bin);
+      if (fs.existsSync(p)) return p;
     }
   }
-  for (const p of ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium']) {
-    if (fs.existsSync(p)) return p;
-  }
-  throw new Error('找不到 Chrome：设 CHROME=/path/to/chrome，或运行 npx puppeteer browsers install chrome');
+  throw new Error('找不到 Chrome：装一个（apt install google-chrome-stable，或 npx puppeteer browsers install chrome），'
+    + '或用 CHROME=/path/to/chrome 指定');
 }
+
 
 const [,, dirArg = 'frames', seedS = '7', widthS = '', tabsS = '4'] = process.argv;
 const dir = dirArg, seed = +seedS, tabs = Math.max(1, +tabsS);

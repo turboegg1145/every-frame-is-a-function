@@ -129,7 +129,11 @@ S.nz = rng(hash(seed,'nz',n))                   // 每帧重掷：噪声场
 
 ```bash
 npm i                                  # 只依赖 puppeteer-core
-npx puppeteer browsers install chrome  # WSL/Debian 上还要装一堆 libnss3 之类的
+# Chrome 用系统里正经装的那个，不要塞在 ~/.cache 里：
+sudo apt install -y ./google-chrome-stable_current_amd64.deb
+#   下载 curl -sSL -O https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+#   没有 sudo：dpkg-deb -x <deb> ~/.local/opt/google-chrome-stable，再把 opt/google/chrome/chrome 链到 ~/.local/bin/
+#   WSL/Debian 上还要装一堆 libnss3 之类的运行库
 node audio.mjs                         # -> out/track.wav（纯 Node 合成，零依赖，约 5 秒）
 node render.mjs frames 7               # -> frames/f00000.png … f00719.png（720 帧，4 标签页并行，~3.5 分钟）
 ./build.sh                             # -> out/film.mp4（BT.709 + AAC + faststart，自动校验帧数/时长）

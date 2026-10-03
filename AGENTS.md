@@ -10,7 +10,9 @@
 ## 怎么跑
 
 ```bash
-npm i && npx puppeteer browsers install chrome
+npm i
+# 还要一个 Chrome：用系统装的（apt install ./google-chrome-stable_*.deb；没有 sudo 就 dpkg-deb -x 到 ~/.local/opt/）
+# 脚本按 CHROME -> 系统路径 -> ~/.cache/puppeteer 的顺序找，所以缓存里那份即使被删也不影响
 node shot.mjs 0 90 400        # 只看三帧（改画面时的主力）
 SHEET=shots/sheet.png node render.mjs frames 7   # 24 格拉片自检
 node render.mjs frames 7      # 全片 720 帧（4 标签页，约 3.5 分钟）
