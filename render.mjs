@@ -20,7 +20,18 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const puppeteer = require('puppeteer-core');
+let puppeteer;
+try {
+  puppeteer = require('puppeteer-core');               // ① 项目里的 node_modules
+} catch {
+  try {
+    // ② 回退到「当前运行目录」的 node_modules
+    puppeteer = createRequire(path.join(process.cwd(), 'noop.js'))('puppeteer-core');
+  } catch {
+    console.error('缺依赖：在当前项目跑 `npm i puppeteer-core`。');
+    process.exit(1);
+  }
+}
 
 /* ---------- 找到 Chrome。优先用环境变量，其次 puppeteer 的缓存目录（最高版本） ---------- */
 function findChrome() {

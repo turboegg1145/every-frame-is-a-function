@@ -1,10 +1,21 @@
 /* 静帧取样：node shot.mjs 0 100 250 563 ...  -> shots/f00000.png
    给人眼看的自检工具，比整片渲染快得多。 */
-import puppeteer from 'puppeteer-core';
 import fs from 'fs';
 import path from 'path';
 
-const HOME = process.env.HOME || '';
+let puppeteer;
+try {
+  ({ default: puppeteer } = await import('puppeteer-core'));
+} catch {
+  try {
+    const { createRequire } = await import('node:module');
+    puppeteer = createRequire(path.join(process.cwd(), 'noop.js'))('puppeteer-core');
+  } catch {
+    console.error('缺依赖：在当前项目跑 `npm i puppeteer-core`。');
+    process.exit(1);
+  }
+}
+
 function findChrome() {
   if (process.env.CHROME) return process.env.CHROME;          // ① 显式指定优先
   if (process.env.CHROME_BIN) return process.env.CHROME_BIN;

@@ -19,6 +19,31 @@ import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(`NAME
+  audio.mjs — 短片配乐合成器（纯 Node，零依赖）：算出 PCM 直接写 WAV
+
+USAGE
+  node scripts/audio.mjs
+
+OUTPUT
+  out/track.wav（相对运行目录）
+
+ENV
+  无。所有参数都是文件顶部的常量：SR / BPM / FPS / DUR / SEC_*
+
+HOW TO CHANGE
+  换片子：改 DUR 与 SEC_* 分节边界，让它们与画面 plate 的边界对齐；
+  改 BPM 会同时改变「1 拍 = 多少帧」，画面那边要一起改。
+
+NOTE
+  这是参考实现（另一条 24 秒片子的乐谱），不是通用配乐机：
+  直接跑会生成 24 秒的曲子，和 6 秒的骨架 demo 对不上，
+  build.sh 会打印音画时长不一致的警告——那是提醒，不是报错。`);
+
+  process.exit(0);
+}
+
 /* ============================================================
  * 0. 全局常量与时基
  * ============================================================ */
