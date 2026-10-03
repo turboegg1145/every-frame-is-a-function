@@ -5,3 +5,4 @@ out/track.wav
 out/*.tmp.mp4
 out/.tmp*
 .DS_Store
+.measure-tmp.mjs
