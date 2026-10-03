@@ -152,6 +152,10 @@ build.sh          编码 + 校验
 docs/             评审用的对比图（每一张都是我当时真的盯着看过的）
 ```
 
+> **给 agent 看**：这个仓库根目录有一份 [`AGENTS.md`](AGENTS.md)，写的是改这部片子时不能违反的确定性约束，以及它特有的三个陷阱（递归闸门、转场吃掉末帧、首尾相接）。
+> 想要完整的工作流——技能包、参考资料、四个脚本、QA 清单——去 [code-animation-kit](https://github.com/turboegg1145/code-animation-kit)：
+> 它的 `.agents/skills/code-animation/` 是一份符合开放 Agent Skills 标准的技能包，Antigravity 和 Claude Code 都能直接读。
+
 ---
 
 ## 诚实的部分
