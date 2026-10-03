@@ -78,6 +78,7 @@ if (process.env.SHEET) {
   const n = +(process.env.SHEET_N || 24), cw = +(process.env.SHEET_W || 480);
   const f0 = +(process.env.SHEET_FROM || 0), f1 = process.env.SHEET_TO ? +process.env.SHEET_TO : total - 1;
   const u = await p0.evaluate((n, cw, f0, f1) => window.RISO.contact(n, cw, f0, f1), n, cw, f0, f1);
+  fs.mkdirSync(path.dirname(path.resolve(process.env.SHEET)), { recursive: true });
   fs.writeFileSync(process.env.SHEET, Buffer.from(u.split(',')[1], 'base64'));
   console.log(`拉片 ${n} 格 -> ${process.env.SHEET}（${f0}..${f1}）`);
   await b.close();

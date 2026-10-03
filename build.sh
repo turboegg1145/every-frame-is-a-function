@@ -18,6 +18,7 @@ FRAMES=${FRAMES:-frames}
 AUDIO=${AUDIO:-out/track.wav}
 OUT=${OUT:-out/film.mp4}
 TMP="${OUT%.mp4}.tmp.mp4"
+mkdir -p "$(dirname "$OUT")"
 
 [ -d "$FRAMES" ] || { echo "没有 $FRAMES/，先跑 node render.mjs $FRAMES"; exit 1; }
 N=$(ls "$FRAMES"/f*.png 2>/dev/null | wc -l)
